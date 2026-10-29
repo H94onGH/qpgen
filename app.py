@@ -11,7 +11,7 @@ import jwt
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from pydantic import BaseModel, Field, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Index, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Index, inspect, text, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tpg_dev.db")
@@ -52,6 +52,13 @@ class User(Base):
     subscription_expires_at = Column(DateTime(timezone=True), nullable=True)
     plan_id = Column(String(20), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    is_blocked = Column(Integer, default=0, nullable=False)
+    admin_note = Column(String(2000), nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    pdf_limit_override = Column(Integer, nullable=True)
+    docx_limit_override = Column(Integer, nullable=True)
+    standard_limit_override = Column(Integer, nullable=True)
+    subject_limit_override = Column(Integer, nullable=True)
 
 class PaymentOrder(Base):
     __tablename__ = "payment_orders"
@@ -123,6 +130,28 @@ def migrate_plan_columns():
             conn.execute(text("ALTER TABLE payment_orders ADD COLUMN plan_id VARCHAR(20) NOT NULL DEFAULT 'basic'"))
 
 migrate_plan_columns()
+
+def migrate_admin_columns():
+    """Add admin-management fields without dropping existing user data."""
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    definitions = {
+        "is_blocked": "INTEGER NOT NULL DEFAULT 0",
+        "admin_note": "VARCHAR(2000)",
+        "last_seen_at": "TIMESTAMP",
+        "pdf_limit_override": "INTEGER",
+        "docx_limit_override": "INTEGER",
+        "standard_limit_override": "INTEGER",
+        "subject_limit_override": "INTEGER",
+    }
+    with engine.begin() as conn:
+        for name, definition in definitions.items():
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
+
+migrate_admin_columns()
 
 app = FastAPI(title="Totally Paper Generator API", version="2.0.0")
 
@@ -202,6 +231,10 @@ def current_user(authorization: Optional[str] = Header(default=None), db: Sessio
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User account not found.")
+    if bool(user.is_blocked):
+        raise HTTPException(status_code=403, detail="This account has been suspended. Contact the administrator.")
+    user.last_seen_at = utcnow()
+    db.commit()
     return user
 
 def subscription_active(user: User) -> bool:
@@ -354,6 +387,8 @@ class CreatePaymentBody(BaseModel):
 def get_subscription(user: User = Depends(current_user)):
     active = subscription_active(user)
     plan = PLAN_CATALOG.get((user.plan_id or "").lower())
+    pdf_limit = user.pdf_limit_override if user.pdf_limit_override is not None else (plan["pdf_limit"] if plan else 0)
+    docx_limit = user.docx_limit_override if user.docx_limit_override is not None else (plan["docx_limit"] if plan else 0)
     return {
         "subscription_active": active,
         "active": active,
@@ -361,8 +396,8 @@ def get_subscription(user: User = Depends(current_user)):
         "plan_name": plan["name"] if plan else None,
         "plan_price_paise": plan["price_paise"] if plan else None,
         "login_attempt_limit": plan["attempts"] if plan else None,
-        "pdf_limit": plan["pdf_limit"] if plan else 0,
-        "docx_limit": plan["docx_limit"] if plan else 0,
+        "pdf_limit": pdf_limit,
+        "docx_limit": docx_limit,
         "expires_at": user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
     }
 
@@ -400,6 +435,8 @@ def generation_usage_status(user: User = Depends(current_user), db: Session = De
     if not plan:
         raise HTTPException(status_code=403, detail="No valid subscription plan is attached to this account.")
     usage = get_or_create_usage(db, user.id)
+    pdf_limit = user.pdf_limit_override if user.pdf_limit_override is not None else int(plan["pdf_limit"])
+    docx_limit = user.docx_limit_override if user.docx_limit_override is not None else int(plan["docx_limit"])
     return {
         "plan_id": user.plan_id,
         "plan_name": plan["name"],
@@ -407,11 +444,11 @@ def generation_usage_status(user: User = Depends(current_user), db: Session = De
         "subscription_active": subscription_active(user),
         "expires_at": user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
         "pdf_used": int(usage.pdf_used or 0),
-        "pdf_limit": int(plan["pdf_limit"]),
-        "pdf_remaining": max(0, int(plan["pdf_limit"]) - int(usage.pdf_used or 0)),
+        "pdf_limit": int(pdf_limit),
+        "pdf_remaining": max(0, int(pdf_limit) - int(usage.pdf_used or 0)),
         "docx_used": int(usage.docx_used or 0),
-        "docx_limit": int(plan["docx_limit"]),
-        "docx_remaining": max(0, int(plan["docx_limit"]) - int(usage.docx_used or 0)),
+        "docx_limit": int(docx_limit),
+        "docx_remaining": max(0, int(docx_limit) - int(usage.docx_used or 0)),
     }
 
 @app.post("/usage/consume")
@@ -428,7 +465,8 @@ def consume_generation(body: GenerationRequest, user: User = Depends(current_use
         query = query.with_for_update()
     usage = query.first()
     field = "pdf_used" if body.kind == "pdf" else "docx_used"
-    limit = int(plan["pdf_limit"] if body.kind == "pdf" else plan["docx_limit"])
+    override = user.pdf_limit_override if body.kind == "pdf" else user.docx_limit_override
+    limit = int(override if override is not None else (plan["pdf_limit"] if body.kind == "pdf" else plan["docx_limit"]))
     used = int(getattr(usage, field) or 0)
     if used >= limit:
         raise HTTPException(status_code=429, detail=f"Monthly {body.kind.upper()} generation limit reached ({limit}).")
@@ -530,3 +568,233 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
         if order and int(entity.get("amount_paid", 0)) >= order.amount_paise:
             activate_order(db, order)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Secure Admin API
+# Configure ADMIN_USERNAME and ADMIN_PASSWORD in Render Environment.
+# APP_SECRET must be a long, random secret. Never put admin credentials in this file.
+# ---------------------------------------------------------------------------
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+
+class AdminLoginBody(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+class AdminUserUpdateBody(BaseModel):
+    plan_id: Optional[str] = Field(default=None, pattern=r"^(basic|standard|premium)$")
+    expires_at: Optional[str] = None
+    is_blocked: Optional[bool] = None
+    pdf_limit_override: Optional[int] = Field(default=None, ge=0)
+    docx_limit_override: Optional[int] = Field(default=None, ge=0)
+    standard_limit_override: Optional[int] = Field(default=None, ge=0)
+    subject_limit_override: Optional[int] = Field(default=None, ge=0)
+    admin_note: Optional[str] = Field(default=None, max_length=2000)
+
+def require_admin_config():
+    missing = []
+    if not ADMIN_USERNAME:
+        missing.append("ADMIN_USERNAME")
+    if not ADMIN_PASSWORD:
+        missing.append("ADMIN_PASSWORD")
+    if not APP_SECRET:
+        missing.append("APP_SECRET")
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin setup incomplete. Set Render environment variables: " + ", ".join(missing)
+        )
+
+def admin_token(username: str) -> str:
+    now = utcnow()
+    return jwt.encode(
+        {"sub": username, "role": "admin", "iat": now, "exp": now + timedelta(hours=8)},
+        APP_SECRET,
+        algorithm="HS256",
+    )
+
+def current_admin(authorization: Optional[str] = Header(default=None)):
+    require_admin_config()
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Administrator login required.")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, APP_SECRET, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Admin session expired or invalid. Please log in again.")
+    if payload.get("role") != "admin" or payload.get("sub") != ADMIN_USERNAME:
+        raise HTTPException(status_code=403, detail="Administrator access required.")
+    return payload
+
+def _dt_iso(value):
+    return value.isoformat() if value else None
+
+def _admin_user_dict(db: Session, user: User):
+    usage = db.query(GenerationUsage).filter(
+        GenerationUsage.user_id == user.id,
+        GenerationUsage.period == current_usage_period(),
+    ).first()
+    plan = PLAN_CATALOG.get((user.plan_id or "").lower()) or {}
+    pdf_used = int(usage.pdf_used or 0) if usage else 0
+    docx_used = int(usage.docx_used or 0) if usage else 0
+    pdf_limit = user.pdf_limit_override if user.pdf_limit_override is not None else int(plan.get("pdf_limit", 0))
+    docx_limit = user.docx_limit_override if user.docx_limit_override is not None else int(plan.get("docx_limit", 0))
+    seen = user.last_seen_at
+    if seen and seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    online = bool(seen and seen >= utcnow() - timedelta(minutes=5))
+    return {
+        "id": user.id,
+        "email": user.email,
+        "phone": user.phone,
+        "plan_id": user.plan_id,
+        "expires_at": _dt_iso(user.subscription_expires_at),
+        "subscription_active": subscription_active(user),
+        "is_blocked": bool(user.is_blocked),
+        "online": online,
+        "last_seen_at": _dt_iso(user.last_seen_at),
+        "created_at": _dt_iso(user.created_at),
+        "pdf_used": pdf_used,
+        "pdf_limit": int(pdf_limit),
+        "docx_used": docx_used,
+        "docx_limit": int(docx_limit),
+        "overrides": {
+            "pdf": user.pdf_limit_override,
+            "docx": user.docx_limit_override,
+            "standard": user.standard_limit_override,
+            "subject": user.subject_limit_override,
+        },
+        "admin_note": user.admin_note,
+    }
+
+@app.post("/admin/login")
+def admin_login(body: AdminLoginBody):
+    require_admin_config()
+    username_ok = hmac.compare_digest(body.username.strip(), ADMIN_USERNAME)
+    password_ok = hmac.compare_digest(body.password, ADMIN_PASSWORD)
+    if not (username_ok and password_ok):
+        # Do not reveal which credential was wrong.
+        raise HTTPException(status_code=401, detail="Invalid administrator username or password.")
+    return {"access_token": admin_token(ADMIN_USERNAME), "token_type": "bearer", "expires_in": 28800}
+
+@app.get("/admin/dashboard")
+def admin_dashboard(admin=Depends(current_admin), db: Session = Depends(get_db)):
+    now = utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    total_users = db.query(func.count(User.id)).scalar() or 0
+    users = db.query(User).all()
+    active = sum(1 for u in users if subscription_active(u))
+    expired = sum(1 for u in users if u.plan_id and not subscription_active(u))
+    blocked = sum(1 for u in users if bool(u.is_blocked))
+    online = 0
+    for u in users:
+        seen = u.last_seen_at
+        if seen and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        if seen and seen >= now - timedelta(minutes=5):
+            online += 1
+    pdf_month = db.query(func.coalesce(func.sum(GenerationUsage.pdf_used), 0)).filter(
+        GenerationUsage.period == now.strftime("%Y-%m")
+    ).scalar() or 0
+    docx_month = db.query(func.coalesce(func.sum(GenerationUsage.docx_used), 0)).filter(
+        GenerationUsage.period == now.strftime("%Y-%m")
+    ).scalar() or 0
+    return {
+        "total_users": int(total_users),
+        "online_users": int(online),
+        "active_subscriptions": int(active),
+        "expired_subscriptions": int(expired),
+        "blocked_users": int(blocked),
+        "pdf_generated_this_month": int(pdf_month),
+        "docx_generated_this_month": int(docx_month),
+    }
+
+@app.post("/admin/plan-rules/refresh")
+def admin_refresh_plan_rules(admin=Depends(current_admin)):
+    # This backend currently uses PLAN_CATALOG in app.py, not a connected Google Sheet.
+    # Return the server-side rules without claiming that an external sheet was refreshed.
+    return {
+        "ok": True,
+        "source": "backend PLAN_CATALOG",
+        "message": "No Google Sheets PlanRules connection is configured; returned the current backend plan rules.",
+        "plans": PLAN_CATALOG,
+    }
+
+@app.get("/admin/users")
+def admin_list_users(
+    q: str = "",
+    status: str = "all",
+    limit: int = 250,
+    admin=Depends(current_admin),
+    db: Session = Depends(get_db),
+):
+    limit = max(1, min(int(limit), 250))
+    query = db.query(User)
+    search = q.strip()
+    if search:
+        like = f"%{search}%"
+        query = query.filter((User.email.ilike(like)) | (User.phone.ilike(like)))
+    users = query.order_by(User.id.desc()).limit(limit).all()
+    now = utcnow()
+    result = []
+    for user in users:
+        item = _admin_user_dict(db, user)
+        if status == "blocked" and not item["is_blocked"]:
+            continue
+        if status == "online" and not item["online"]:
+            continue
+        if status == "active" and not item["subscription_active"]:
+            continue
+        if status == "expired" and (not user.plan_id or item["subscription_active"]):
+            continue
+        if status not in ("all", "online", "active", "expired", "blocked"):
+            raise HTTPException(status_code=400, detail="Invalid status filter.")
+        result.append(item)
+    return {"users": result, "count": len(result)}
+
+@app.get("/admin/users/{user_id}")
+def admin_get_user(user_id: int, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return _admin_user_dict(db, user)
+
+@app.patch("/admin/users/{user_id}")
+def admin_update_user(
+    user_id: int,
+    body: AdminUserUpdateBody,
+    admin=Depends(current_admin),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    changes = body.model_dump(exclude_unset=True)
+    if "plan_id" in changes:
+        user.plan_id = changes["plan_id"]
+    if "expires_at" in changes:
+        raw = changes["expires_at"]
+        if raw in (None, ""):
+            user.subscription_expires_at = None
+        else:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                user.subscription_expires_at = parsed.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expires_at must be a valid ISO date/time.")
+    for field in (
+        "is_blocked", "pdf_limit_override", "docx_limit_override",
+        "standard_limit_override", "subject_limit_override", "admin_note"
+    ):
+        if field in changes:
+            value = changes[field]
+            if field == "is_blocked":
+                value = 1 if value else 0
+            setattr(user, field, value)
+    db.commit()
+    db.refresh(user)
+    return {"ok": True, "user": _admin_user_dict(db, user)}
