@@ -11,7 +11,7 @@ import jwt
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from pydantic import BaseModel, Field, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Index, inspect, text, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Index, inspect, text, func, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tpg_dev.db")
@@ -69,6 +69,10 @@ class PaymentOrder(Base):
     status = Column(String(32), default="created", nullable=False)
     amount_paise = Column(Integer, nullable=False, default=9900)
     plan_id = Column(String(20), nullable=False, default="basic")
+    scheme_id = Column(Integer, nullable=True, index=True)
+    pdf_limit_snapshot = Column(Integer, nullable=True)
+    docx_limit_snapshot = Column(Integer, nullable=True)
+    validity_days_snapshot = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     paid_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -94,6 +98,24 @@ class EmailOTP(Base):
     used_at = Column(DateTime(timezone=True), nullable=True)
 
 Index("ix_emailotp_email_created", EmailOTP.email, EmailOTP.created_at)
+
+class PlanScheme(Base):
+    __tablename__ = "plan_schemes"
+    id = Column(Integer, primary_key=True)
+    title = Column(String(120), nullable=False)
+    plan_id = Column(String(20), nullable=False, index=True)
+    price_paise = Column(Integer, nullable=False)
+    pdf_limit = Column(Integer, nullable=False, default=30)
+    docx_limit = Column(Integer, nullable=False, default=30)
+    validity_days = Column(Integer, nullable=False, default=30)
+    original_price_paise = Column(Integer, nullable=True)
+    description = Column(String(1000), nullable=True)
+    starts_at = Column(DateTime(timezone=True), nullable=True)
+    ends_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -130,6 +152,23 @@ def migrate_plan_columns():
             conn.execute(text("ALTER TABLE payment_orders ADD COLUMN plan_id VARCHAR(20) NOT NULL DEFAULT 'basic'"))
 
 migrate_plan_columns()
+
+def migrate_scheme_columns():
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        if "payment_orders" in inspector.get_table_names():
+            cols = {c["name"] for c in inspector.get_columns("payment_orders")}
+            definitions = {
+                "scheme_id": "INTEGER",
+                "pdf_limit_snapshot": "INTEGER",
+                "docx_limit_snapshot": "INTEGER",
+                "validity_days_snapshot": "INTEGER",
+            }
+            for name, definition in definitions.items():
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE payment_orders ADD COLUMN {name} {definition}"))
+
+migrate_scheme_columns()
 
 def migrate_admin_columns():
     """Add admin-management fields without dropping existing user data."""
@@ -282,7 +321,13 @@ def activate_order(db: Session, order: PaymentOrder):
 
     # Replace any old subscription. Do NOT add the old remaining validity.
     user.plan_id = new_plan_id
-    user.subscription_expires_at = now + timedelta(days=30)
+    validity_days = int(order.validity_days_snapshot or 30)
+    user.subscription_expires_at = now + timedelta(days=validity_days)
+    # Apply the limits that were locked into the order at checkout time.
+    if order.pdf_limit_snapshot is not None:
+        user.pdf_limit_override = int(order.pdf_limit_snapshot)
+    if order.docx_limit_snapshot is not None:
+        user.docx_limit_override = int(order.docx_limit_snapshot)
 
     # Reset this month's usage on every new successful subscription purchase.
     # Older months remain in the database for history; the current month starts fresh.
@@ -380,8 +425,70 @@ def verify_otp(body: VerifyOTPBody, db: Session = Depends(get_db)):
         "email": user.email,
     }
 
+def _as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+def scheme_is_current(scheme: PlanScheme, now=None):
+    now = now or utcnow()
+    starts = _as_utc(scheme.starts_at)
+    ends = _as_utc(scheme.ends_at)
+    return bool(scheme.is_active and (starts is None or starts <= now) and (ends is None or ends >= now))
+
+def scheme_dict(scheme: PlanScheme):
+    now = utcnow()
+    original = scheme.original_price_paise
+    discount = 0
+    if original and original > scheme.price_paise:
+        discount = round((original - scheme.price_paise) * 100 / original)
+    return {
+        "scheme_id": scheme.id,
+        "title": scheme.title,
+        "plan_id": scheme.plan_id,
+        "plan_name": PLAN_CATALOG[scheme.plan_id]["name"],
+        "price_paise": int(scheme.price_paise),
+        "price_inr": int(scheme.price_paise) / 100,
+        "original_price_paise": original,
+        "original_price_inr": (int(original) / 100) if original is not None else None,
+        "discount_percent": discount,
+        "pdf_limit": int(scheme.pdf_limit),
+        "docx_limit": int(scheme.docx_limit),
+        "validity_days": int(scheme.validity_days),
+        "description": scheme.description or "",
+        "starts_at": scheme.starts_at.isoformat() if scheme.starts_at else None,
+        "ends_at": scheme.ends_at.isoformat() if scheme.ends_at else None,
+        "is_active": bool(scheme.is_active),
+        "currently_available": scheme_is_current(scheme, now),
+    }
+
+@app.get("/plans")
+def list_available_plans(db: Session = Depends(get_db)):
+    """Public endpoint for plan selection; returns active schemes and fallback plans."""
+    schemes = db.query(PlanScheme).order_by(PlanScheme.price_paise.asc(), PlanScheme.id.desc()).all()
+    available = [scheme_dict(x) for x in schemes if scheme_is_current(x)]
+    if available:
+        return {"plans": available, "source": "active_schemes"}
+    # Keep existing clients working until at least one scheme is configured.
+    fallback = []
+    for plan_id, plan in PLAN_CATALOG.items():
+        fallback.append({
+            "scheme_id": None, "title": plan["name"].title(), "plan_id": plan_id,
+            "plan_name": plan["name"], "price_paise": int(plan["price_paise"]),
+            "price_inr": int(plan["price_paise"]) / 100,
+            "original_price_paise": None, "original_price_inr": None,
+            "discount_percent": 0, "pdf_limit": int(plan["pdf_limit"]),
+            "docx_limit": int(plan["docx_limit"]), "validity_days": 30,
+            "description": "", "starts_at": None, "ends_at": None,
+            "is_active": True, "currently_available": True,
+        })
+    return {"plans": fallback, "source": "default_catalog"}
+
 class CreatePaymentBody(BaseModel):
     plan_id: str = Field(default="basic", pattern=r"^(basic|standard|premium)$")
+    scheme_id: Optional[int] = Field(default=None, ge=1)
 
 @app.get("/subscription/status")
 def get_subscription(user: User = Depends(current_user)):
@@ -496,10 +603,37 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
     require_config("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET")
     plan_id = body.plan_id.lower()
     plan = PLAN_CATALOG[plan_id]
-    amount_paise = int(plan["price_paise"])
+    scheme = None
+    if body.scheme_id is not None:
+        scheme = db.query(PlanScheme).filter(PlanScheme.id == body.scheme_id).first()
+        if not scheme or not scheme_is_current(scheme):
+            raise HTTPException(status_code=400, detail="This offer is no longer available. Refresh the plans and select an active offer.")
+        plan_id = scheme.plan_id
+    else:
+        # Compatibility for older clients: use the most recent active scheme for this plan.
+        candidates = db.query(PlanScheme).filter(
+            PlanScheme.plan_id == plan_id, PlanScheme.is_active.is_(True)
+        ).order_by(PlanScheme.id.desc()).all()
+        scheme = next((item for item in candidates if scheme_is_current(item)), None)
+    if scheme:
+        amount_paise = int(scheme.price_paise)
+        pdf_limit_snapshot = int(scheme.pdf_limit)
+        docx_limit_snapshot = int(scheme.docx_limit)
+        validity_days_snapshot = int(scheme.validity_days)
+        plan_name = scheme.title
+        scheme_id = scheme.id
+    else:
+        amount_paise = int(plan["price_paise"])
+        pdf_limit_snapshot = int(plan["pdf_limit"])
+        docx_limit_snapshot = int(plan["docx_limit"])
+        validity_days_snapshot = 30
+        plan_name = plan["name"]
+        scheme_id = None
     reference = secrets.token_urlsafe(18)
     order = PaymentOrder(reference_id=reference, user_id=user.id, amount_paise=amount_paise,
-                         plan_id=plan_id, status="creating")
+                         plan_id=plan_id, scheme_id=scheme_id,
+                         pdf_limit_snapshot=pdf_limit_snapshot, docx_limit_snapshot=docx_limit_snapshot,
+                         validity_days_snapshot=validity_days_snapshot, status="creating")
     db.add(order)
     db.commit()
     db.refresh(order)
@@ -507,11 +641,11 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
         "amount": amount_paise,
         "currency": "INR",
         "accept_partial": False,
-        "description": f"Totally Paper Generator - {plan['name']} plan - 30 days access",
+        "description": f"Totally Paper Generator - {plan_name} - {validity_days_snapshot} days access",
         "reference_id": reference,
         "reminder_enable": False,
         "notes": {"user_id": str(user.id), "reference_id": reference,
-                  "product": "Totally Paper Generator", "plan_id": plan_id},
+                  "product": "Totally Paper Generator", "plan_id": plan_id, "scheme_id": str(scheme_id or "")},
     }
     data = razorpay_request("POST", "/payment_links", payload)
     link_id = data.get("id")
@@ -522,7 +656,9 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
     order.status = str(data.get("status", "created"))
     db.commit()
     return {"order_id": link_id, "payment_url": payment_url, "plan_id": plan_id,
-            "plan_name": plan["name"], "amount_paise": amount_paise}
+            "scheme_id": scheme_id, "plan_name": plan_name, "amount_paise": amount_paise,
+            "pdf_limit": pdf_limit_snapshot, "docx_limit": docx_limit_snapshot,
+            "validity_days": validity_days_snapshot}
 
 @app.get("/payments/status/{order_id}")
 def payment_status(order_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -710,6 +846,92 @@ def admin_dashboard(admin=Depends(current_admin), db: Session = Depends(get_db))
         "pdf_generated_this_month": int(pdf_month),
         "docx_generated_this_month": int(docx_month),
     }
+
+class SchemeCreateBody(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    plan_id: str = Field(pattern=r"^(basic|standard|premium)$")
+    price_inr: int = Field(ge=0, le=1000000)
+    pdf_limit: int = Field(ge=0, le=10000000)
+    docx_limit: int = Field(ge=0, le=10000000)
+    validity_days: int = Field(ge=1, le=3650)
+    original_price_inr: Optional[int] = Field(default=None, ge=0, le=1000000)
+    description: Optional[str] = Field(default="", max_length=1000)
+    starts_at: Optional[str] = None
+    ends_at: Optional[str] = None
+    is_active: bool = True
+
+def parse_optional_datetime(value, field_name):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an ISO date/time.")
+
+def apply_scheme_body(scheme, body):
+    scheme.title = body.title.strip()
+    if not scheme.title:
+        raise HTTPException(status_code=400, detail="Offer title cannot be blank.")
+    scheme.plan_id = body.plan_id
+    scheme.price_paise = int(body.price_inr) * 100
+    scheme.pdf_limit = int(body.pdf_limit)
+    scheme.docx_limit = int(body.docx_limit)
+    scheme.validity_days = int(body.validity_days)
+    scheme.original_price_paise = int(body.original_price_inr) * 100 if body.original_price_inr is not None else None
+    scheme.description = (body.description or "").strip()
+    scheme.starts_at = parse_optional_datetime(body.starts_at, "starts_at")
+    scheme.ends_at = parse_optional_datetime(body.ends_at, "ends_at")
+    if scheme.starts_at and scheme.ends_at and scheme.ends_at < scheme.starts_at:
+        raise HTTPException(status_code=400, detail="Offer expiry must be after its start date.")
+    scheme.is_active = bool(body.is_active)
+    scheme.updated_at = utcnow()
+
+@app.get("/admin/schemes")
+def admin_list_schemes(admin=Depends(current_admin), db: Session = Depends(get_db)):
+    schemes = db.query(PlanScheme).order_by(PlanScheme.id.desc()).all()
+    return {"schemes": [scheme_dict(x) for x in schemes], "count": len(schemes)}
+
+@app.post("/admin/schemes")
+def admin_create_scheme(body: SchemeCreateBody, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    scheme = PlanScheme(
+        title=body.title.strip(), plan_id=body.plan_id, price_paise=body.price_inr * 100,
+        pdf_limit=body.pdf_limit, docx_limit=body.docx_limit, validity_days=body.validity_days,
+        original_price_paise=body.original_price_inr * 100 if body.original_price_inr is not None else None,
+        description=(body.description or "").strip(),
+        starts_at=parse_optional_datetime(body.starts_at, "starts_at"),
+        ends_at=parse_optional_datetime(body.ends_at, "ends_at"),
+        is_active=body.is_active, created_at=utcnow(), updated_at=utcnow()
+    )
+    if scheme.starts_at and scheme.ends_at and scheme.ends_at < scheme.starts_at:
+        raise HTTPException(status_code=400, detail="Offer expiry must be after its start date.")
+    if not scheme.title:
+        raise HTTPException(status_code=400, detail="Offer title cannot be blank.")
+    db.add(scheme)
+    db.commit()
+    db.refresh(scheme)
+    return {"ok": True, "scheme": scheme_dict(scheme)}
+
+@app.put("/admin/schemes/{scheme_id}")
+def admin_update_scheme(scheme_id: int, body: SchemeCreateBody, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    scheme = db.query(PlanScheme).filter(PlanScheme.id == scheme_id).first()
+    if not scheme:
+        raise HTTPException(status_code=404, detail="Offer not found.")
+    apply_scheme_body(scheme, body)
+    db.commit()
+    db.refresh(scheme)
+    return {"ok": True, "scheme": scheme_dict(scheme)}
+
+@app.delete("/admin/schemes/{scheme_id}")
+def admin_delete_scheme(scheme_id: int, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    scheme = db.query(PlanScheme).filter(PlanScheme.id == scheme_id).first()
+    if not scheme:
+        raise HTTPException(status_code=404, detail="Offer not found.")
+    db.delete(scheme)
+    db.commit()
+    return {"ok": True, "deleted_id": scheme_id}
 
 @app.post("/admin/plan-rules/refresh")
 def admin_refresh_plan_rules(admin=Depends(current_admin)):
