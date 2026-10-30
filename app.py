@@ -59,6 +59,12 @@ class User(Base):
     docx_limit_override = Column(Integer, nullable=True)
     standard_limit_override = Column(Integer, nullable=True)
     subject_limit_override = Column(Integer, nullable=True)
+    # Snapshot of the exact plan/offer purchased; survives later admin edits/deletion.
+    current_scheme_id = Column(Integer, nullable=True)
+    current_scheme_title = Column(String(120), nullable=True)
+    current_scheme_description = Column(String(1000), nullable=True)
+    current_scheme_price_paise = Column(Integer, nullable=True)
+    subscription_validity_days = Column(Integer, nullable=True)
 
 class PaymentOrder(Base):
     __tablename__ = "payment_orders"
@@ -73,6 +79,8 @@ class PaymentOrder(Base):
     pdf_limit_snapshot = Column(Integer, nullable=True)
     docx_limit_snapshot = Column(Integer, nullable=True)
     validity_days_snapshot = Column(Integer, nullable=True)
+    scheme_title_snapshot = Column(String(120), nullable=True)
+    scheme_description_snapshot = Column(String(1000), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     paid_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -170,6 +178,8 @@ def migrate_scheme_columns():
                 "pdf_limit_snapshot": "INTEGER",
                 "docx_limit_snapshot": "INTEGER",
                 "validity_days_snapshot": "INTEGER",
+                "scheme_title_snapshot": "VARCHAR(120)",
+                "scheme_description_snapshot": "VARCHAR(1000)",
             }
             for name, definition in definitions.items():
                 if name not in cols:
@@ -233,6 +243,11 @@ def migrate_admin_columns():
         "docx_limit_override": "INTEGER",
         "standard_limit_override": "INTEGER",
         "subject_limit_override": "INTEGER",
+        "current_scheme_id": "INTEGER",
+        "current_scheme_title": "VARCHAR(120)",
+        "current_scheme_description": "VARCHAR(1000)",
+        "current_scheme_price_paise": "INTEGER",
+        "subscription_validity_days": "INTEGER",
     }
     with engine.begin() as conn:
         for name, definition in definitions.items():
@@ -372,6 +387,11 @@ def activate_order(db: Session, order: PaymentOrder):
     user.plan_id = new_plan_id
     validity_days = int(order.validity_days_snapshot or 30)
     user.subscription_expires_at = now + timedelta(days=validity_days)
+    user.current_scheme_id = order.scheme_id
+    user.current_scheme_title = order.scheme_title_snapshot or PLAN_CATALOG.get(new_plan_id, {}).get("name", new_plan_id.title())
+    user.current_scheme_description = order.scheme_description_snapshot or ""
+    user.current_scheme_price_paise = int(order.amount_paise or 0)
+    user.subscription_validity_days = validity_days
     # Apply the limits that were locked into the order at checkout time.
     if order.pdf_limit_snapshot is not None:
         user.pdf_limit_override = int(order.pdf_limit_snapshot)
@@ -527,8 +547,36 @@ class CreatePaymentBody(BaseModel):
     plan_id: str = Field(default="basic", pattern=r"^(basic|standard|premium)$")
     scheme_id: Optional[int] = Field(default=None, ge=1)
 
+def purchased_plan_details(db: Session, user: User):
+    """Return the saved purchase snapshot, with a safe fallback for older purchases."""
+    latest_order = db.query(PaymentOrder).filter(
+        PaymentOrder.user_id == user.id, PaymentOrder.status == "paid"
+    ).order_by(PaymentOrder.id.desc()).first()
+    scheme = None
+    scheme_id = user.current_scheme_id or (latest_order.scheme_id if latest_order else None)
+    if scheme_id:
+        scheme = db.query(PlanScheme).filter(PlanScheme.id == scheme_id).first()
+    plan = PLAN_CATALOG.get((user.plan_id or "").lower()) or {}
+    return {
+        "scheme_id": scheme_id,
+        "scheme_title": (user.current_scheme_title or
+                         (scheme.title if scheme else None) or
+                         (latest_order.scheme_title_snapshot if latest_order else None) or
+                         plan.get("name")),
+        "scheme_description": (user.current_scheme_description or
+                               (scheme.description if scheme else "") or
+                               (latest_order.scheme_description_snapshot if latest_order else "")),
+        "price_paise": (user.current_scheme_price_paise if user.current_scheme_price_paise is not None
+                        else (latest_order.amount_paise if latest_order else None)),
+        "validity_days": (user.subscription_validity_days or
+                          (latest_order.validity_days_snapshot if latest_order else None) or 30),
+        "standard_limit": user.standard_limit_override,
+        "subject_limit": user.subject_limit_override,
+    }
+
 @app.get("/subscription/status")
-def get_subscription(user: User = Depends(current_user)):
+def get_subscription(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    details = purchased_plan_details(db, user)
     active = subscription_active(user)
     plan = PLAN_CATALOG.get((user.plan_id or "").lower())
     pdf_limit = user.pdf_limit_override if user.pdf_limit_override is not None else (plan["pdf_limit"] if plan else 0)
@@ -543,6 +591,7 @@ def get_subscription(user: User = Depends(current_user)):
         "pdf_limit": pdf_limit,
         "docx_limit": docx_limit,
         "expires_at": user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
+        **details,
     }
 
 # Online monthly generation counters used by the Android app.
@@ -579,6 +628,7 @@ def generation_usage_status(user: User = Depends(current_user), db: Session = De
     if not plan:
         raise HTTPException(status_code=403, detail="No valid subscription plan is attached to this account.")
     usage = get_or_create_usage(db, user.id)
+    details = purchased_plan_details(db, user)
     pdf_limit = user.pdf_limit_override if user.pdf_limit_override is not None else int(plan["pdf_limit"])
     docx_limit = user.docx_limit_override if user.docx_limit_override is not None else int(plan["docx_limit"])
     return {
@@ -593,6 +643,7 @@ def generation_usage_status(user: User = Depends(current_user), db: Session = De
         "docx_used": int(usage.docx_used or 0),
         "docx_limit": int(docx_limit),
         "docx_remaining": max(0, int(docx_limit) - int(usage.docx_used or 0)),
+        **details,
     }
 
 @app.post("/usage/consume")
@@ -658,6 +709,8 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
         docx_limit_snapshot = int(scheme.docx_limit)
         validity_days_snapshot = int(scheme.validity_days)
         plan_name = scheme.title
+        scheme_title_snapshot = scheme.title
+        scheme_description_snapshot = scheme.description or ""
         scheme_id = scheme.id
     else:
         amount_paise = int(plan["price_paise"])
@@ -665,12 +718,16 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
         docx_limit_snapshot = int(plan["docx_limit"])
         validity_days_snapshot = 30
         plan_name = plan["name"]
+        scheme_title_snapshot = plan["name"]
+        scheme_description_snapshot = ""
         scheme_id = None
     reference = secrets.token_urlsafe(18)
     order = PaymentOrder(reference_id=reference, user_id=user.id, amount_paise=amount_paise,
                          plan_id=plan_id, scheme_id=scheme_id,
                          pdf_limit_snapshot=pdf_limit_snapshot, docx_limit_snapshot=docx_limit_snapshot,
-                         validity_days_snapshot=validity_days_snapshot, status="creating")
+                         validity_days_snapshot=validity_days_snapshot,
+                         scheme_title_snapshot=scheme_title_snapshot,
+                         scheme_description_snapshot=scheme_description_snapshot, status="creating")
     db.add(order)
     db.commit()
     db.refresh(order)
@@ -695,7 +752,9 @@ def create_payment(body: CreatePaymentBody, user: User = Depends(current_user), 
     return {"order_id": link_id, "payment_url": payment_url, "plan_id": plan_id,
             "scheme_id": scheme_id, "plan_name": plan_name, "amount_paise": amount_paise,
             "pdf_limit": pdf_limit_snapshot, "docx_limit": docx_limit_snapshot,
-            "validity_days": validity_days_snapshot}
+            "validity_days": validity_days_snapshot,
+            "scheme_title": scheme_title_snapshot,
+            "scheme_description": scheme_description_snapshot}
 
 @app.get("/payments/status/{order_id}")
 def payment_status(order_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
