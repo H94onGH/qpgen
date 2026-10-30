@@ -99,6 +99,12 @@ class EmailOTP(Base):
 
 Index("ix_emailotp_email_created", EmailOTP.email, EmailOTP.created_at)
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    key = Column(String(100), primary_key=True)
+    value = Column(String(500), nullable=False, default="")
+
+
 class PlanScheme(Base):
     __tablename__ = "plan_schemes"
     id = Column(Integer, primary_key=True)
@@ -113,6 +119,7 @@ class PlanScheme(Base):
     starts_at = Column(DateTime(timezone=True), nullable=True)
     ends_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
+    is_default = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -169,6 +176,48 @@ def migrate_scheme_columns():
                     conn.execute(text(f"ALTER TABLE payment_orders ADD COLUMN {name} {definition}"))
 
 migrate_scheme_columns()
+
+def migrate_plan_scheme_type():
+    inspector = inspect(engine)
+    if "plan_schemes" in inspector.get_table_names():
+        cols = {c["name"] for c in inspector.get_columns("plan_schemes")}
+        if "is_default" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE plan_schemes ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT FALSE"))
+
+migrate_plan_scheme_type()
+
+def seed_initial_plan_cards():
+    """Seed standard cards once; after that admin edits/deletes persist."""
+    db = SessionLocal()
+    try:
+        seeded = db.query(AppSetting).filter(AppSetting.key == "initial_plan_cards_seeded").first()
+        if seeded:
+            return
+        if db.query(PlanScheme).filter(PlanScheme.is_default.is_(True)).count() == 0:
+            initial_cards = {
+                "basic": {"name": "Basic", "price_paise": 9900, "pdf_limit": 15, "docx_limit": 10},
+                "standard": {"name": "Standard", "price_paise": 14900, "pdf_limit": 30, "docx_limit": 15},
+                "premium": {"name": "Premium", "price_paise": 19900, "pdf_limit": 30, "docx_limit": 15},
+            }
+            for plan_id, plan in initial_cards.items():
+                db.add(PlanScheme(
+                    title=plan["name"], plan_id=plan_id,
+                    price_paise=int(plan["price_paise"]),
+                    pdf_limit=int(plan["pdf_limit"]), docx_limit=int(plan["docx_limit"]),
+                    validity_days=30, description="Monthly generation allowance",
+                    is_active=True, is_default=True,
+                    created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+                ))
+        db.add(AppSetting(key="initial_plan_cards_seeded", value="true"))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+seed_initial_plan_cards()
 
 def migrate_admin_columns():
     """Add admin-management fields without dropping existing user data."""
@@ -461,30 +510,18 @@ def scheme_dict(scheme: PlanScheme):
         "starts_at": scheme.starts_at.isoformat() if scheme.starts_at else None,
         "ends_at": scheme.ends_at.isoformat() if scheme.ends_at else None,
         "is_active": bool(scheme.is_active),
+        "is_default": bool(getattr(scheme, "is_default", False)),
         "currently_available": scheme_is_current(scheme, now),
     }
 
 @app.get("/plans")
 def list_available_plans(db: Session = Depends(get_db)):
-    """Public endpoint for plan selection; returns active schemes and fallback plans."""
-    schemes = db.query(PlanScheme).order_by(PlanScheme.price_paise.asc(), PlanScheme.id.desc()).all()
+    """Public endpoint for every active standard plan and special offer."""
+    schemes = db.query(PlanScheme).order_by(
+        PlanScheme.is_default.desc(), PlanScheme.price_paise.asc(), PlanScheme.id.asc()
+    ).all()
     available = [scheme_dict(x) for x in schemes if scheme_is_current(x)]
-    if available:
-        return {"plans": available, "source": "active_schemes"}
-    # Keep existing clients working until at least one scheme is configured.
-    fallback = []
-    for plan_id, plan in PLAN_CATALOG.items():
-        fallback.append({
-            "scheme_id": None, "title": plan["name"].title(), "plan_id": plan_id,
-            "plan_name": plan["name"], "price_paise": int(plan["price_paise"]),
-            "price_inr": int(plan["price_paise"]) / 100,
-            "original_price_paise": None, "original_price_inr": None,
-            "discount_percent": 0, "pdf_limit": int(plan["pdf_limit"]),
-            "docx_limit": int(plan["docx_limit"]), "validity_days": 30,
-            "description": "", "starts_at": None, "ends_at": None,
-            "is_active": True, "currently_available": True,
-        })
-    return {"plans": fallback, "source": "default_catalog"}
+    return {"plans": available, "source": "database"}
 
 class CreatePaymentBody(BaseModel):
     plan_id: str = Field(default="basic", pattern=r"^(basic|standard|premium)$")
@@ -850,6 +887,7 @@ def admin_dashboard(admin=Depends(current_admin), db: Session = Depends(get_db))
 class SchemeCreateBody(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     plan_id: str = Field(pattern=r"^(basic|standard|premium)$")
+    is_default: bool = False
     price_inr: int = Field(ge=0, le=1000000)
     pdf_limit: int = Field(ge=0, le=10000000)
     docx_limit: int = Field(ge=0, le=10000000)
@@ -887,6 +925,7 @@ def apply_scheme_body(scheme, body):
     if scheme.starts_at and scheme.ends_at and scheme.ends_at < scheme.starts_at:
         raise HTTPException(status_code=400, detail="Offer expiry must be after its start date.")
     scheme.is_active = bool(body.is_active)
+    scheme.is_default = bool(body.is_default)
     scheme.updated_at = utcnow()
 
 @app.get("/admin/schemes")
@@ -896,6 +935,12 @@ def admin_list_schemes(admin=Depends(current_admin), db: Session = Depends(get_d
 
 @app.post("/admin/schemes")
 def admin_create_scheme(body: SchemeCreateBody, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    if body.is_default:
+        existing = db.query(PlanScheme).filter(
+            PlanScheme.is_default.is_(True), PlanScheme.plan_id == body.plan_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="A standard plan already exists for this plan type. Edit that plan instead.")
     scheme = PlanScheme(
         title=body.title.strip(), plan_id=body.plan_id, price_paise=body.price_inr * 100,
         pdf_limit=body.pdf_limit, docx_limit=body.docx_limit, validity_days=body.validity_days,
@@ -903,7 +948,8 @@ def admin_create_scheme(body: SchemeCreateBody, admin=Depends(current_admin), db
         description=(body.description or "").strip(),
         starts_at=parse_optional_datetime(body.starts_at, "starts_at"),
         ends_at=parse_optional_datetime(body.ends_at, "ends_at"),
-        is_active=body.is_active, created_at=utcnow(), updated_at=utcnow()
+        is_active=body.is_active, is_default=body.is_default,
+        created_at=utcnow(), updated_at=utcnow()
     )
     if scheme.starts_at and scheme.ends_at and scheme.ends_at < scheme.starts_at:
         raise HTTPException(status_code=400, detail="Offer expiry must be after its start date.")
@@ -918,7 +964,15 @@ def admin_create_scheme(body: SchemeCreateBody, admin=Depends(current_admin), db
 def admin_update_scheme(scheme_id: int, body: SchemeCreateBody, admin=Depends(current_admin), db: Session = Depends(get_db)):
     scheme = db.query(PlanScheme).filter(PlanScheme.id == scheme_id).first()
     if not scheme:
-        raise HTTPException(status_code=404, detail="Offer not found.")
+        raise HTTPException(status_code=404, detail="Plan or offer not found.")
+    if body.is_default:
+        duplicate = db.query(PlanScheme).filter(
+            PlanScheme.is_default.is_(True),
+            PlanScheme.plan_id == body.plan_id,
+            PlanScheme.id != scheme_id
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="A standard plan already exists for this plan type.")
     apply_scheme_body(scheme, body)
     db.commit()
     db.refresh(scheme)
