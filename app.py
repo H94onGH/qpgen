@@ -900,11 +900,31 @@ def _admin_user_dict(db: Session, user: User):
     if seen and seen.tzinfo is None:
         seen = seen.replace(tzinfo=timezone.utc)
     online = bool(seen and seen >= utcnow() - timedelta(minutes=5))
+    purchase_details = purchased_plan_details(db, user)
+    base_plan = PLAN_CATALOG.get((user.plan_id or "").lower()) or {}
+    current_scheme = None
+    if purchase_details.get("scheme_id"):
+        current_scheme = db.query(PlanScheme).filter(
+            PlanScheme.id == purchase_details["scheme_id"]
+        ).first()
+
     return {
         "id": user.id,
         "email": user.email,
         "phone": user.phone,
         "plan_id": user.plan_id,
+        "plan_name": base_plan.get("name"),
+        "base_plan_price_paise": base_plan.get("price_paise"),
+        "scheme_id": purchase_details.get("scheme_id"),
+        "scheme_title": purchase_details.get("scheme_title"),
+        "scheme_description": purchase_details.get("scheme_description"),
+        "purchased_price_paise": purchase_details.get("price_paise"),
+        "purchased_validity_days": purchase_details.get("validity_days"),
+        "scheme_original_price_paise": (
+            int(current_scheme.original_price_paise)
+            if current_scheme and current_scheme.original_price_paise is not None
+            else None
+        ),
         "expires_at": _dt_iso(user.subscription_expires_at),
         "subscription_active": subscription_active(user),
         "is_blocked": bool(user.is_blocked),
