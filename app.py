@@ -486,6 +486,11 @@ def verify_otp(body: VerifyOTPBody, db: Session = Depends(get_db)):
         db.add(user)
     db.commit()
     db.refresh(user)
+    if bool(user.is_blocked):
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been suspended. Contact the administrator."
+        )
     return {
         "access_token": create_access_token(user),
         "token_type": "bearer",
