@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import jwt
@@ -532,16 +533,31 @@ def scheme_dict(scheme: PlanScheme):
         "is_active": bool(scheme.is_active),
         "is_default": bool(getattr(scheme, "is_default", False)),
         "currently_available": scheme_is_current(scheme, now),
+        "availability_reason": (
+            "inactive" if not scheme.is_active else
+            "starts_later" if _as_utc(scheme.starts_at) and _as_utc(scheme.starts_at) > now else
+            "expired" if _as_utc(scheme.ends_at) and _as_utc(scheme.ends_at) < now else
+            "available"
+        ),
     }
 
 @app.get("/plans")
 def list_available_plans(db: Session = Depends(get_db)):
-    """Public endpoint for every active standard plan and special offer."""
-    schemes = db.query(PlanScheme).order_by(
+    """Return all active database plans/offers with availability status.
+    The client displays only currently_available entries; scheduled/expired
+    entries remain visible in JSON for diagnosis and Admin date correction.
+    """
+    schemes = db.query(PlanScheme).filter(
+        PlanScheme.is_active.is_(True)
+    ).order_by(
         PlanScheme.is_default.desc(), PlanScheme.price_paise.asc(), PlanScheme.id.asc()
     ).all()
-    available = [scheme_dict(x) for x in schemes if scheme_is_current(x)]
-    return {"plans": available, "source": "database"}
+    rows = [scheme_dict(x) for x in schemes]
+    return {
+        "plans": rows,
+        "available_count": sum(1 for x in rows if x["currently_available"]),
+        "source": "database",
+    }
 
 class CreatePaymentBody(BaseModel):
     plan_id: str = Field(default="basic", pattern=r"^(basic|standard|premium)$")
@@ -596,7 +612,8 @@ def get_subscription(user: User = Depends(current_user), db: Session = Depends(g
 
 # Online monthly generation counters used by the Android app.
 def current_usage_period():
-    return utcnow().strftime("%Y-%m")
+    # Monthly quota resets at midnight on the first day of the month in India.
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m")
 
 def get_or_create_usage(db: Session, user_id: int):
     period = current_usage_period()
@@ -622,8 +639,8 @@ class GenerationRequest(BaseModel):
 
 @app.get("/usage/status")
 def generation_usage_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if not subscription_active(user):
-        raise HTTPException(status_code=403, detail="An active subscription is required to view usage.")
+    # Status is readable even after expiry so the dashboard can explain why
+    # generation is locked and offer renewal. Only /usage/consume authorizes use.
     plan = PLAN_CATALOG.get((user.plan_id or "").lower())
     if not plan:
         raise HTTPException(status_code=403, detail="No valid subscription plan is attached to this account.")
@@ -682,7 +699,8 @@ def release_generation(body: GenerationRequest, user: User = Depends(current_use
     usage.updated_at = utcnow()
     db.commit()
     plan = PLAN_CATALOG.get((user.plan_id or "").lower()) or {"pdf_limit": 0, "docx_limit": 0}
-    limit = int(plan["pdf_limit"] if body.kind == "pdf" else plan["docx_limit"])
+    override = user.pdf_limit_override if body.kind == "pdf" else user.docx_limit_override
+    limit = int(override if override is not None else (plan["pdf_limit"] if body.kind == "pdf" else plan["docx_limit"]))
     used = int(getattr(usage, field) or 0)
     return {"kind": body.kind, "used": used, "limit": limit, "remaining": max(0, limit - used), "period": usage.period}
 
@@ -962,8 +980,10 @@ def parse_optional_datetime(value, field_name):
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Admin enters local Indian date/time values. Interpret values without
+        # an explicit offset as Asia/Kolkata, then store in UTC.
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail=f"{field_name} must be an ISO date/time.")
