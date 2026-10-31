@@ -900,29 +900,61 @@ def _admin_user_dict(db: Session, user: User):
     if seen and seen.tzinfo is None:
         seen = seen.replace(tzinfo=timezone.utc)
     online = bool(seen and seen >= utcnow() - timedelta(minutes=5))
-    purchase_details = purchased_plan_details(db, user)
-    base_plan = PLAN_CATALOG.get((user.plan_id or "").lower()) or {}
-    current_scheme = None
-    if purchase_details.get("scheme_id"):
-        current_scheme = db.query(PlanScheme).filter(
-            PlanScheme.id == purchase_details["scheme_id"]
-        ).first()
+
+    # Resolve the exact purchased offer from all available snapshots.
+    # User fields are the durable subscription snapshot; PaymentOrder is the
+    # fallback for accounts created before those fields were populated.
+    latest_order = db.query(PaymentOrder).filter(
+        PaymentOrder.user_id == user.id,
+        PaymentOrder.status == "paid",
+    ).order_by(PaymentOrder.id.desc()).first()
+
+    scheme_id = user.current_scheme_id or (latest_order.scheme_id if latest_order else None)
+    scheme = db.query(PlanScheme).filter(PlanScheme.id == scheme_id).first() if scheme_id else None
+
+    scheme_title = (
+        getattr(user, "current_scheme_title", None)
+        or (scheme.title if scheme else None)
+        or (latest_order.scheme_title_snapshot if latest_order else None)
+    )
+    # If no custom offer title was stored, display the plan catalog name,
+    # but expose the base plan separately so Admin never mistakes it for an offer.
+    if not scheme_title:
+        scheme_title = plan.get("name") or (user.plan_id or "No plan").title()
+
+    purchased_price_paise = getattr(user, "current_scheme_price_paise", None)
+    if purchased_price_paise is None and latest_order:
+        purchased_price_paise = latest_order.amount_paise
+    if purchased_price_paise is None and scheme:
+        purchased_price_paise = scheme.price_paise
+
+    validity_days = (
+        getattr(user, "subscription_validity_days", None)
+        or (latest_order.validity_days_snapshot if latest_order else None)
+        or (scheme.validity_days if scheme else None)
+    )
 
     return {
         "id": user.id,
         "email": user.email,
         "phone": user.phone,
         "plan_id": user.plan_id,
-        "plan_name": base_plan.get("name"),
-        "base_plan_price_paise": base_plan.get("price_paise"),
-        "scheme_id": purchase_details.get("scheme_id"),
-        "scheme_title": purchase_details.get("scheme_title"),
-        "scheme_description": purchase_details.get("scheme_description"),
-        "purchased_price_paise": purchase_details.get("price_paise"),
-        "purchased_validity_days": purchase_details.get("validity_days"),
+        "plan_name": plan.get("name"),
+        "base_plan_price_paise": plan.get("price_paise"),
+        "scheme_id": scheme_id,
+        "scheme_title": scheme_title,
+        "purchased_offer_title": scheme_title,
+        "scheme_description": (
+            getattr(user, "current_scheme_description", None)
+            or (scheme.description if scheme else None)
+            or (latest_order.scheme_description_snapshot if latest_order else None)
+            or ""
+        ),
+        "purchased_price_paise": purchased_price_paise,
+        "purchased_validity_days": validity_days,
         "scheme_original_price_paise": (
-            int(current_scheme.original_price_paise)
-            if current_scheme and current_scheme.original_price_paise is not None
+            int(scheme.original_price_paise)
+            if scheme and scheme.original_price_paise is not None
             else None
         ),
         "expires_at": _dt_iso(user.subscription_expires_at),
