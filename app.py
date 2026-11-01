@@ -4,6 +4,9 @@ import hmac
 import hashlib
 import secrets
 import re
+import base64
+import hashlib
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -14,6 +17,8 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Index, inspect, text, func, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy import UniqueConstraint
+import openpyxl
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tpg_dev.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -95,6 +100,16 @@ class GenerationUsage(Base):
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 Index("uq_generation_usage_user_period", GenerationUsage.user_id, GenerationUsage.period, unique=True)
+
+class QuestionBankRecord(Base):
+    __tablename__ = "question_bank_records"
+    id = Column(Integer, primary_key=True)
+    sheet_name = Column(String(40), nullable=False, index=True)
+    data_json = Column(String(12000), nullable=False)
+    fingerprint = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    __table_args__ = (UniqueConstraint("sheet_name", "fingerprint", name="uq_question_bank_sheet_fingerprint"),)
 
 class EmailOTP(Base):
     __tablename__ = "email_otp_requests"
@@ -883,6 +898,175 @@ def current_admin(authorization: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=403, detail="Administrator access required.")
     return payload
 
+
+# ---------------------------------------------------------------------------
+# Online question bank. Excel import is ADD-ONLY: duplicate rows are skipped.
+# PlanRules is deliberately not imported; plans remain managed by Plan Schemes.
+# ---------------------------------------------------------------------------
+QUESTION_BANK_SHEETS = {
+    "Schools": ["SchoolName"],
+    "Standards": ["Standard"],
+    "QuestionTypes": ["Question Type"],
+    "Sections": ["Sections"],
+    "Subjects": ["Subject"],
+    "TotalMarks": ["TotalMarks"],
+    "ExamTitles": ["ExamTitle"],
+    "Questions": ["Section", "QuestionType", "Question", "Marks", "Subject", "Standard"],
+    "Instructions": ["Question Type", "Instruction"],
+    "Mark": ["Question Type", "Mark"],
+    "Time": ["Time"],
+}
+
+def _qb_clean(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+def _qb_fingerprint(sheet_name, values):
+    canonical = json.dumps(
+        [sheet_name.casefold()] + [re.sub(r"\s+", " ", _qb_clean(v)).casefold() for v in values],
+        ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+def _qb_row_values(sheet_name, data):
+    headers = QUESTION_BANK_SHEETS[sheet_name]
+    return [_qb_clean(data.get(h, "")) for h in headers]
+
+def _qb_record_dict(record):
+    return {"id": record.id, "sheet": record.sheet_name, "values": json.loads(record.data_json)}
+
+class QuestionBankImportBody(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_base64: str = Field(min_length=20)
+
+class QuestionBankRecordBody(BaseModel):
+    values: dict
+
+@app.post("/admin/question-bank/import")
+def admin_import_question_bank(body: QuestionBankImportBody, admin=Depends(current_admin), db: Session = Depends(get_db)):
+    if not body.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Please upload an .xlsx workbook.")
+    try:
+        raw = base64.b64decode(body.content_base64, validate=True)
+        if len(raw) > 15 * 1024 * 1024:
+            raise ValueError("Workbook is larger than 15 MB.")
+        wb = openpyxl.load_workbook(BytesIO(raw), read_only=True, data_only=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Could not read the Excel workbook: " + str(exc))
+    summary = {}
+    try:
+        for sheet_name, expected_headers in QUESTION_BANK_SHEETS.items():
+            if sheet_name not in wb.sheetnames:
+                summary[sheet_name] = {"inserted": 0, "skipped": 0, "invalid": 0, "message": "Sheet not found"}
+                continue
+            ws = wb[sheet_name]
+            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            normalized = {re.sub(r"[^a-z0-9]", "", _qb_clean(v).casefold()): i for i, v in enumerate(header_row)}
+            indexes = []
+            missing = []
+            for header in expected_headers:
+                key = re.sub(r"[^a-z0-9]", "", header.casefold())
+                idx = normalized.get(key)
+                if idx is None and sheet_name == "Sections":
+                    idx = normalized.get("section")
+                if idx is None and sheet_name == "Mark" and header == "Mark":
+                    idx = normalized.get("marks")
+                if idx is None:
+                    missing.append(header)
+                indexes.append(idx)
+            if missing:
+                summary[sheet_name] = {"inserted": 0, "skipped": 0, "invalid": 0, "message": "Missing columns: " + ", ".join(missing)}
+                continue
+            inserted = skipped = invalid = 0
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                vals = [_qb_clean(row[i]) if i < len(row) else "" for i in indexes]
+                if not any(vals):
+                    continue
+                if sheet_name == "Questions" and (not vals[2] or not vals[5] or not vals[0] or not vals[1]):
+                    invalid += 1
+                    continue
+                if sheet_name in ("Instructions", "Mark") and not vals[0]:
+                    invalid += 1
+                    continue
+                data = dict(zip(expected_headers, vals))
+                fingerprint = _qb_fingerprint(sheet_name, vals)
+                exists = db.query(QuestionBankRecord.id).filter(
+                    QuestionBankRecord.sheet_name == sheet_name,
+                    QuestionBankRecord.fingerprint == fingerprint
+                ).first()
+                if exists:
+                    skipped += 1
+                    continue
+                db.add(QuestionBankRecord(sheet_name=sheet_name,
+                    data_json=json.dumps(data, ensure_ascii=False), fingerprint=fingerprint))
+                inserted += 1
+            db.flush()
+            summary[sheet_name] = {"inserted": inserted, "skipped": skipped, "invalid": invalid}
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        wb.close()
+    return {"ok": True, "mode": "add_only", "excluded_sheets": ["PlanRules"], "sheets": summary,
+            "totals": {key: sum(v.get(key, 0) for v in summary.values()) for key in ("inserted", "skipped", "invalid")}}
+
+@app.get("/admin/question-bank/{sheet_name}")
+def admin_list_question_bank(sheet_name: str, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    if sheet_name not in QUESTION_BANK_SHEETS:
+        raise HTTPException(status_code=404, detail="Unknown question-bank sheet.")
+    rows = db.query(QuestionBankRecord).filter(QuestionBankRecord.sheet_name == sheet_name).order_by(QuestionBankRecord.id.asc()).all()
+    return {"sheet": sheet_name, "headers": QUESTION_BANK_SHEETS[sheet_name], "records": [_qb_record_dict(x) for x in rows]}
+
+@app.post("/admin/question-bank/{sheet_name}")
+def admin_add_question_bank_record(sheet_name: str, body: QuestionBankRecordBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    if sheet_name not in QUESTION_BANK_SHEETS:
+        raise HTTPException(status_code=404, detail="Unknown question-bank sheet.")
+    vals = _qb_row_values(sheet_name, body.values)
+    if not any(vals):
+        raise HTTPException(status_code=400, detail="Enter at least one value.")
+    if sheet_name == "Questions" and (not vals[0] or not vals[1] or not vals[2] or not vals[4] or not vals[5]):
+        raise HTTPException(status_code=400, detail="Section, Question Type, Question, Subject and Standard are required.")
+    fp = _qb_fingerprint(sheet_name, vals)
+    if db.query(QuestionBankRecord.id).filter_by(sheet_name=sheet_name, fingerprint=fp).first():
+        return {"ok": True, "duplicate": True, "message": "Duplicate skipped."}
+    row = QuestionBankRecord(sheet_name=sheet_name, data_json=json.dumps(dict(zip(QUESTION_BANK_SHEETS[sheet_name], vals)), ensure_ascii=False), fingerprint=fp)
+    db.add(row); db.commit(); db.refresh(row)
+    return {"ok": True, "record": _qb_record_dict(row)}
+
+@app.put("/admin/question-bank/{sheet_name}/{record_id}")
+def admin_update_question_bank_record(sheet_name: str, record_id: int, body: QuestionBankRecordBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    if sheet_name not in QUESTION_BANK_SHEETS:
+        raise HTTPException(status_code=404, detail="Unknown question-bank sheet.")
+    row = db.query(QuestionBankRecord).filter_by(id=record_id, sheet_name=sheet_name).first()
+    if not row: raise HTTPException(status_code=404, detail="Record not found.")
+    vals = _qb_row_values(sheet_name, body.values); fp = _qb_fingerprint(sheet_name, vals)
+    duplicate = db.query(QuestionBankRecord.id).filter(QuestionBankRecord.sheet_name==sheet_name, QuestionBankRecord.fingerprint==fp, QuestionBankRecord.id!=record_id).first()
+    if duplicate: raise HTTPException(status_code=409, detail="Another identical record already exists.")
+    row.data_json=json.dumps(dict(zip(QUESTION_BANK_SHEETS[sheet_name], vals)), ensure_ascii=False)
+    row.fingerprint=fp; row.updated_at=utcnow(); db.commit(); db.refresh(row)
+    return {"ok": True, "record": _qb_record_dict(row)}
+
+@app.delete("/admin/question-bank/{sheet_name}/{record_id}")
+def admin_delete_question_bank_record(sheet_name: str, record_id: int, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    if sheet_name not in QUESTION_BANK_SHEETS:
+        raise HTTPException(status_code=404, detail="Unknown question-bank sheet.")
+    row=db.query(QuestionBankRecord).filter_by(id=record_id, sheet_name=sheet_name).first()
+    if not row: raise HTTPException(status_code=404, detail="Record not found.")
+    db.delete(row); db.commit()
+    return {"ok": True, "deleted_id": record_id}
+
+@app.get("/question-bank/{sheet_name}")
+def get_question_bank_sheet(sheet_name: str, user: User=Depends(current_user), db: Session=Depends(get_db)):
+    if sheet_name not in QUESTION_BANK_SHEETS:
+        raise HTTPException(status_code=404, detail="Unknown question-bank sheet.")
+    rows=db.query(QuestionBankRecord).filter_by(sheet_name=sheet_name).order_by(QuestionBankRecord.id.asc()).all()
+    return {"sheet": sheet_name, "headers": QUESTION_BANK_SHEETS[sheet_name], "records": [_qb_record_dict(x) for x in rows]}
+
+
 def _dt_iso(value):
     return value.isoformat() if value else None
 
@@ -1123,16 +1307,6 @@ def admin_delete_scheme(scheme_id: int, admin=Depends(current_admin), db: Sessio
     db.commit()
     return {"ok": True, "deleted_id": scheme_id}
 
-@app.post("/admin/plan-rules/refresh")
-def admin_refresh_plan_rules(admin=Depends(current_admin)):
-    # This backend currently uses PLAN_CATALOG in app.py, not a connected Google Sheet.
-    # Return the server-side rules without claiming that an external sheet was refreshed.
-    return {
-        "ok": True,
-        "source": "backend PLAN_CATALOG",
-        "message": "No Google Sheets PlanRules connection is configured; returned the current backend plan rules.",
-        "plans": PLAN_CATALOG,
-    }
 
 @app.get("/admin/users")
 def admin_list_users(
