@@ -111,6 +111,18 @@ class QuestionBankRecord(Base):
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     __table_args__ = (UniqueConstraint("sheet_name", "fingerprint", name="uq_question_bank_sheet_fingerprint"),)
 
+class BlueprintPreset(Base):
+    __tablename__ = "blueprint_presets"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), nullable=False)
+    exam_title = Column(String(120), nullable=False, index=True)
+    standard = Column(String(60), nullable=False, index=True)
+    subject = Column(String(100), nullable=False, index=True)
+    items_json = Column(String(30000), nullable=False, default="[]")
+    fingerprint = Column(String(64), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
 class EmailOTP(Base):
     __tablename__ = "email_otp_requests"
     id = Column(Integer, primary_key=True)
@@ -1058,6 +1070,100 @@ def admin_delete_question_bank_record(sheet_name: str, record_id: int, admin=Dep
     if not row: raise HTTPException(status_code=404, detail="Record not found.")
     db.delete(row); db.commit()
     return {"ok": True, "deleted_id": record_id}
+
+class BlueprintBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    exam_title: str = Field(min_length=1, max_length=120)
+    standard: str = Field(min_length=1, max_length=60)
+    subject: str = Field(min_length=1, max_length=100)
+    items: list = Field(min_length=1)
+
+def _blueprint_norm(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+def _blueprint_fingerprint(name, exam_title, standard, subject):
+    raw = "|".join(_blueprint_norm(x) for x in (name, exam_title, standard, subject))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _blueprint_dict(row):
+    return {"id": row.id, "name": row.name, "exam_title": row.exam_title,
+            "standard": row.standard, "subject": row.subject,
+            "items": json.loads(row.items_json)}
+
+def _validate_blueprint_items(items, db, standard, subject):
+    if not items:
+        raise HTTPException(status_code=400, detail="Add at least one question to the blueprint.")
+    bank_rows = db.query(QuestionBankRecord).filter_by(sheet_name="Questions").all()
+    bank = [json.loads(x.data_json) for x in bank_rows]
+    clean, seen = [], set()
+    for item in items:
+        section = str(item.get("section", "")).strip()
+        qtype = str(item.get("question_type", "")).strip()
+        question = str(item.get("question", "")).strip()
+        try: marks = float(item.get("marks", 0))
+        except (TypeError, ValueError): marks = 0
+        if not all((section, qtype, question)) or marks <= 0:
+            raise HTTPException(status_code=400, detail="Each blueprint item needs Section, Question Type, Question and positive Marks.")
+        match = next((q for q in bank if _blueprint_norm(q.get("Standard")) == _blueprint_norm(standard)
+                      and _blueprint_norm(q.get("Subject")) == _blueprint_norm(subject)
+                      and _blueprint_norm(q.get("Section")) == _blueprint_norm(section)
+                      and _blueprint_norm(q.get("QuestionType")) == _blueprint_norm(qtype)
+                      and _blueprint_norm(q.get("Question")) == _blueprint_norm(question)), None)
+        if not match:
+            raise HTTPException(status_code=400, detail="A blueprint question does not exist in the selected Standard and Subject question bank.")
+        key = (_blueprint_norm(section), _blueprint_norm(qtype), _blueprint_norm(question))
+        if key in seen:
+            raise HTTPException(status_code=409, detail="The same question is listed more than once in this blueprint.")
+        seen.add(key)
+        clean.append({"section": match.get("Section"), "question_type": match.get("QuestionType"),
+                      "question": match.get("Question"), "marks": marks})
+    return clean
+
+@app.get("/admin/blueprints")
+def admin_list_blueprints(admin=Depends(current_admin), db: Session=Depends(get_db)):
+    rows = db.query(BlueprintPreset).order_by(BlueprintPreset.exam_title, BlueprintPreset.standard, BlueprintPreset.subject, BlueprintPreset.name).all()
+    return {"records": [_blueprint_dict(x) for x in rows]}
+
+@app.post("/admin/blueprints")
+def admin_create_blueprint(body: BlueprintBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    fp = _blueprint_fingerprint(body.name, body.exam_title, body.standard, body.subject)
+    if db.query(BlueprintPreset.id).filter_by(fingerprint=fp).first():
+        raise HTTPException(status_code=409, detail="A blueprint with this name already exists for this Exam Title, Standard and Subject.")
+    items = _validate_blueprint_items(body.items, db, body.standard, body.subject)
+    row = BlueprintPreset(name=body.name.strip(), exam_title=body.exam_title.strip(),
+        standard=body.standard.strip(), subject=body.subject.strip(),
+        items_json=json.dumps(items, ensure_ascii=False), fingerprint=fp)
+    db.add(row); db.commit(); db.refresh(row)
+    return {"ok": True, "record": _blueprint_dict(row)}
+
+@app.put("/admin/blueprints/{blueprint_id}")
+def admin_update_blueprint(blueprint_id: int, body: BlueprintBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    row = db.query(BlueprintPreset).filter_by(id=blueprint_id).first()
+    if not row: raise HTTPException(status_code=404, detail="Blueprint not found.")
+    fp = _blueprint_fingerprint(body.name, body.exam_title, body.standard, body.subject)
+    duplicate = db.query(BlueprintPreset.id).filter(BlueprintPreset.fingerprint==fp, BlueprintPreset.id!=blueprint_id).first()
+    if duplicate: raise HTTPException(status_code=409, detail="A blueprint with this name already exists for this Exam Title, Standard and Subject.")
+    items = _validate_blueprint_items(body.items, db, body.standard, body.subject)
+    row.name=body.name.strip(); row.exam_title=body.exam_title.strip(); row.standard=body.standard.strip(); row.subject=body.subject.strip()
+    row.items_json=json.dumps(items, ensure_ascii=False); row.fingerprint=fp; row.updated_at=utcnow()
+    db.commit(); db.refresh(row)
+    return {"ok": True, "record": _blueprint_dict(row)}
+
+@app.delete("/admin/blueprints/{blueprint_id}")
+def admin_delete_blueprint(blueprint_id: int, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    row=db.query(BlueprintPreset).filter_by(id=blueprint_id).first()
+    if not row: raise HTTPException(status_code=404, detail="Blueprint not found.")
+    db.delete(row); db.commit()
+    return {"ok": True, "deleted_id": blueprint_id}
+
+@app.get("/blueprints")
+def list_user_blueprints(exam_title: str, standard: str, subject: str,
+                         user: User=Depends(current_user), db: Session=Depends(get_db)):
+    rows=db.query(BlueprintPreset).all()
+    matched=[x for x in rows if _blueprint_norm(x.exam_title)==_blueprint_norm(exam_title)
+             and _blueprint_norm(x.standard)==_blueprint_norm(standard)
+             and _blueprint_norm(x.subject)==_blueprint_norm(subject)]
+    return {"records": [_blueprint_dict(x) for x in matched]}
 
 @app.get("/question-bank/{sheet_name}")
 def get_question_bank_sheet(sheet_name: str, user: User=Depends(current_user), db: Session=Depends(get_db)):
