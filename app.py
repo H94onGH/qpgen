@@ -1072,67 +1072,77 @@ def admin_delete_question_bank_record(sheet_name: str, record_id: int, admin=Dep
     return {"ok": True, "deleted_id": record_id}
 
 class BlueprintBody(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
     exam_title: str = Field(min_length=1, max_length=120)
     standard: str = Field(min_length=1, max_length=60)
     subject: str = Field(min_length=1, max_length=100)
-    items: list = Field(min_length=1)
+    total_marks: float = Field(gt=0)
+    sections: list = Field(min_length=1)
 
 def _blueprint_norm(value):
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
-def _blueprint_fingerprint(name, exam_title, standard, subject):
-    raw = "|".join(_blueprint_norm(x) for x in (name, exam_title, standard, subject))
+def _blueprint_fingerprint(exam_title, standard, subject):
+    raw = "|".join(_blueprint_norm(x) for x in (exam_title, standard, subject))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def _blueprint_dict(row):
-    return {"id": row.id, "name": row.name, "exam_title": row.exam_title,
+    data = json.loads(row.items_json)
+    return {"id": row.id, "name": row.exam_title, "exam_title": row.exam_title,
             "standard": row.standard, "subject": row.subject,
-            "items": json.loads(row.items_json)}
+            "total_marks": data.get("total_marks", 0),
+            "sections": data.get("sections", [])}
 
-def _validate_blueprint_items(items, db, standard, subject):
-    if not items:
-        raise HTTPException(status_code=400, detail="Add at least one question to the blueprint.")
-    bank_rows = db.query(QuestionBankRecord).filter_by(sheet_name="Questions").all()
-    bank = [json.loads(x.data_json) for x in bank_rows]
-    clean, seen = [], set()
-    for item in items:
-        section = str(item.get("section", "")).strip()
-        qtype = str(item.get("question_type", "")).strip()
-        question = str(item.get("question", "")).strip()
-        try: marks = float(item.get("marks", 0))
-        except (TypeError, ValueError): marks = 0
-        if not all((section, qtype, question)) or marks <= 0:
-            raise HTTPException(status_code=400, detail="Each blueprint item needs Section, Question Type, Question and positive Marks.")
-        match = next((q for q in bank if _blueprint_norm(q.get("Standard")) == _blueprint_norm(standard)
-                      and _blueprint_norm(q.get("Subject")) == _blueprint_norm(subject)
-                      and _blueprint_norm(q.get("Section")) == _blueprint_norm(section)
-                      and _blueprint_norm(q.get("QuestionType")) == _blueprint_norm(qtype)
-                      and _blueprint_norm(q.get("Question")) == _blueprint_norm(question)), None)
-        if not match:
-            raise HTTPException(status_code=400, detail="A blueprint question does not exist in the selected Standard and Subject question bank.")
-        key = (_blueprint_norm(section), _blueprint_norm(qtype), _blueprint_norm(question))
-        if key in seen:
-            raise HTTPException(status_code=409, detail="The same question is listed more than once in this blueprint.")
-        seen.add(key)
-        clean.append({"section": match.get("Section"), "question_type": match.get("QuestionType"),
-                      "question": match.get("Question"), "marks": marks})
-    return clean
+def _validate_blueprint_structure(sections, total_marks):
+    if not sections:
+        raise HTTPException(status_code=400, detail="Add at least one section.")
+    clean, seen_sections = [], set()
+    calculated = 0.0
+    for section in sections:
+        section_name = str(section.get("section", "")).strip()
+        if not section_name:
+            raise HTTPException(status_code=400, detail="Every section must have a name.")
+        skey = _blueprint_norm(section_name)
+        if skey in seen_sections:
+            raise HTTPException(status_code=409, detail="Duplicate section name in blueprint.")
+        seen_sections.add(skey)
+        clean_types, seen_types = [], set()
+        for item in section.get("question_types", []):
+            qtype = str(item.get("question_type", "")).strip()
+            try:
+                count = int(item.get("question_count", 0))
+                marks = float(item.get("marks_per_question", 0))
+            except (TypeError, ValueError):
+                count, marks = 0, 0
+            if not qtype or count <= 0 or marks <= 0:
+                raise HTTPException(status_code=400, detail="Each question type needs a name, positive question count and positive marks per question.")
+            tkey = _blueprint_norm(qtype)
+            if tkey in seen_types:
+                raise HTTPException(status_code=409, detail="Duplicate question type inside a section.")
+            seen_types.add(tkey)
+            clean_types.append({"question_type": qtype, "question_count": count,
+                                "marks_per_question": marks})
+            calculated += count * marks
+        if not clean_types:
+            raise HTTPException(status_code=400, detail="Each section must contain at least one question type.")
+        clean.append({"section": section_name, "question_types": clean_types})
+    if abs(calculated - float(total_marks)) > 0.001:
+        raise HTTPException(status_code=400, detail=f"Blueprint total marks mismatch. The question pattern totals {calculated:g}, not {float(total_marks):g}.")
+    return {"total_marks": float(total_marks), "sections": clean}
 
 @app.get("/admin/blueprints")
 def admin_list_blueprints(admin=Depends(current_admin), db: Session=Depends(get_db)):
-    rows = db.query(BlueprintPreset).order_by(BlueprintPreset.exam_title, BlueprintPreset.standard, BlueprintPreset.subject, BlueprintPreset.name).all()
+    rows = db.query(BlueprintPreset).order_by(BlueprintPreset.exam_title, BlueprintPreset.standard, BlueprintPreset.subject).all()
     return {"records": [_blueprint_dict(x) for x in rows]}
 
 @app.post("/admin/blueprints")
 def admin_create_blueprint(body: BlueprintBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
-    fp = _blueprint_fingerprint(body.name, body.exam_title, body.standard, body.subject)
+    fp = _blueprint_fingerprint(body.exam_title, body.standard, body.subject)
     if db.query(BlueprintPreset.id).filter_by(fingerprint=fp).first():
-        raise HTTPException(status_code=409, detail="A blueprint with this name already exists for this Exam Title, Standard and Subject.")
-    items = _validate_blueprint_items(body.items, db, body.standard, body.subject)
-    row = BlueprintPreset(name=body.name.strip(), exam_title=body.exam_title.strip(),
+        raise HTTPException(status_code=409, detail="A blueprint already exists for this Exam Title, Standard and Subject.")
+    structure = _validate_blueprint_structure(body.sections, body.total_marks)
+    row = BlueprintPreset(name=body.exam_title.strip(), exam_title=body.exam_title.strip(),
         standard=body.standard.strip(), subject=body.subject.strip(),
-        items_json=json.dumps(items, ensure_ascii=False), fingerprint=fp)
+        items_json=json.dumps(structure, ensure_ascii=False), fingerprint=fp)
     db.add(row); db.commit(); db.refresh(row)
     return {"ok": True, "record": _blueprint_dict(row)}
 
@@ -1140,12 +1150,13 @@ def admin_create_blueprint(body: BlueprintBody, admin=Depends(current_admin), db
 def admin_update_blueprint(blueprint_id: int, body: BlueprintBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
     row = db.query(BlueprintPreset).filter_by(id=blueprint_id).first()
     if not row: raise HTTPException(status_code=404, detail="Blueprint not found.")
-    fp = _blueprint_fingerprint(body.name, body.exam_title, body.standard, body.subject)
+    fp = _blueprint_fingerprint(body.exam_title, body.standard, body.subject)
     duplicate = db.query(BlueprintPreset.id).filter(BlueprintPreset.fingerprint==fp, BlueprintPreset.id!=blueprint_id).first()
-    if duplicate: raise HTTPException(status_code=409, detail="A blueprint with this name already exists for this Exam Title, Standard and Subject.")
-    items = _validate_blueprint_items(body.items, db, body.standard, body.subject)
-    row.name=body.name.strip(); row.exam_title=body.exam_title.strip(); row.standard=body.standard.strip(); row.subject=body.subject.strip()
-    row.items_json=json.dumps(items, ensure_ascii=False); row.fingerprint=fp; row.updated_at=utcnow()
+    if duplicate: raise HTTPException(status_code=409, detail="A blueprint already exists for this Exam Title, Standard and Subject.")
+    structure = _validate_blueprint_structure(body.sections, body.total_marks)
+    row.name=body.exam_title.strip(); row.exam_title=body.exam_title.strip()
+    row.standard=body.standard.strip(); row.subject=body.subject.strip()
+    row.items_json=json.dumps(structure, ensure_ascii=False); row.fingerprint=fp; row.updated_at=utcnow()
     db.commit(); db.refresh(row)
     return {"ok": True, "record": _blueprint_dict(row)}
 
