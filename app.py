@@ -1245,6 +1245,12 @@ def _admin_user_dict(db: Session, user: User):
         "scheme_id": scheme_id,
         "scheme_title": scheme_title,
         "purchased_offer_title": scheme_title,
+        "scheme_is_default": bool(scheme.is_default) if scheme else (False if scheme_id else None),
+        "subscription_pack_type": (
+            "BASE PLAN" if scheme and bool(scheme.is_default)
+            else "SPECIAL OFFER PACK" if scheme_id
+            else "BASE PLAN"
+        ),
         "scheme_description": (
             getattr(user, "current_scheme_description", None)
             or (scheme.description if scheme else None)
