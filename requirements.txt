@@ -1,8 +1,8 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 SQLAlchemy>=2.0
-psycopg2-binary>=2.9
 PyJWT>=2.8
 requests>=2.31
 email-validator>=2.1
 openpyxl>=3.1.2
+psycopg2-binary>=2.9.9
