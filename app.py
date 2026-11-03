@@ -141,6 +141,15 @@ class AppSetting(Base):
     value = Column(String(500), nullable=False, default="")
 
 
+class QuestionRule(Base):
+    __tablename__ = "question_rules"
+    id = Column(Integer, primary_key=True)
+    question_type = Column(String(160), nullable=False, unique=True, index=True)
+    rule_json = Column(String(12000), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
 class PlanScheme(Base):
     __tablename__ = "plan_schemes"
     id = Column(Integer, primary_key=True)
@@ -852,6 +861,18 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+class QuestionRuleBody(BaseModel):
+    question_type: str = Field(min_length=1, max_length=160)
+    rule_name: str = Field(default="", max_length=160)
+    description: str = Field(default="", max_length=1000)
+    source_separator: str = Field(min_length=1, max_length=80)
+    extra_text_format: str = Field(default="round", pattern=r"^(round|square|curly|plain)$")
+    text_position: str = Field(default="upper", pattern=r"^(upper|bottom|left|right)$")
+    join_separator: str = Field(default=", ", max_length=40)
+    arrangement: str = Field(default="original", pattern=r"^(random|original)$")
+    rule_for: str = Field(default="all_sentences", pattern=r"^(all_sentences|each_sentence)$")
+
+
 # ---------------------------------------------------------------------------
 # Secure Admin API
 # Configure ADMIN_USERNAME and ADMIN_PASSWORD in Render Environment.
@@ -1070,6 +1091,56 @@ def admin_delete_question_bank_record(sheet_name: str, record_id: int, admin=Dep
     if not row: raise HTTPException(status_code=404, detail="Record not found.")
     db.delete(row); db.commit()
     return {"ok": True, "deleted_id": record_id}
+
+def _question_rule_dict(row):
+    try:
+        data = json.loads(row.rule_json or "{}")
+    except Exception:
+        data = {}
+    data.update({"id": row.id, "question_type": row.question_type})
+    return data
+
+
+@app.get("/admin/question-rules")
+def admin_list_question_rules(admin=Depends(current_admin), db: Session=Depends(get_db)):
+    rows = db.query(QuestionRule).order_by(QuestionRule.question_type.asc()).all()
+    return {"rules": [_question_rule_dict(row) for row in rows]}
+
+
+@app.post("/admin/question-rules")
+def admin_save_question_rule(body: QuestionRuleBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    question_type = body.question_type.strip()
+    if not question_type:
+        raise HTTPException(status_code=400, detail="Select a Question Type.")
+    row = db.query(QuestionRule).filter(QuestionRule.question_type == question_type).first()
+    data = body.dict()
+    data["question_type"] = question_type
+    if row is None:
+        row = QuestionRule(question_type=question_type, rule_json=json.dumps(data, ensure_ascii=False))
+        db.add(row)
+    else:
+        row.rule_json = json.dumps(data, ensure_ascii=False)
+        row.updated_at = utcnow()
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "rule": _question_rule_dict(row)}
+
+
+@app.delete("/admin/question-rules/{rule_id}")
+def admin_delete_question_rule(rule_id: int, admin=Depends(current_admin), db: Session=Depends(get_db)):
+    row = db.query(QuestionRule).filter(QuestionRule.id == rule_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Question Rule not found.")
+    db.delete(row)
+    db.commit()
+    return {"ok": True, "deleted_id": rule_id}
+
+
+@app.get("/question-rules")
+def get_question_rules_for_user(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.query(QuestionRule).order_by(QuestionRule.question_type.asc()).all()
+    return {"rules": [_question_rule_dict(row) for row in rows]}
+
 
 class BlueprintBody(BaseModel):
     exam_title: str = Field(min_length=1, max_length=120)
