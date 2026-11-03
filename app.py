@@ -872,6 +872,7 @@ class QuestionRuleBody(BaseModel):
     join_separator: str = Field(default=", ", max_length=40)
     arrangement: str = Field(default="original", pattern=r"^(random|original)$")
     rule_for: str = Field(default="all_sentences", pattern=r"^(all_sentences|each_sentence)$")
+    selection_display_format: str = Field(default="rule", pattern=r"^(rule|original)$")
 
     @validator("source_separator", always=True)
     def validate_rule_separator(cls, value, values):
