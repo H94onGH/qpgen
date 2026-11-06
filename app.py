@@ -865,7 +865,7 @@ class QuestionRuleBody(BaseModel):
     question_type: str = Field(min_length=1, max_length=160)
     rule_name: str = Field(default="", max_length=160)
     description: str = Field(default="", max_length=1000)
-    question_format: str = Field(default="none", pattern=r"^(none|identifying_function|function_response)$")
+    question_format: str = Field(default="none", pattern=r"^(none|identifying_function|function_response|question_framing)$")
     source_separator: str = Field(default="", max_length=80)
     extra_text_format: str = Field(default="round", pattern=r"^(round|square|curly|plain)$")
     text_position: str = Field(default="upper", pattern=r"^(upper|bottom|left|right)$")
@@ -877,7 +877,7 @@ class QuestionRuleBody(BaseModel):
     @validator("source_separator", always=True)
     def validate_rule_separator(cls, value, values):
         question_format = values.get("question_format", "none")
-        if question_format in ("identifying_function", "function_response") and not str(value or "").strip():
+        if question_format in ("identifying_function", "function_response", "question_framing") and not str(value or "").strip():
             raise ValueError("A separator is required for this Question Format.")
         return value
 
