@@ -1118,27 +1118,34 @@ def admin_list_question_rules(admin=Depends(current_admin), db: Session=Depends(
 
 
 @app.post("/admin/question-rules")
-def admin_create_question_rule(body: QuestionRuleBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+def admin_save_question_rule(body: QuestionRuleBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
     question_type = body.question_type.strip()
     if not question_type:
         raise HTTPException(status_code=400, detail="Select a Question Type.")
-    existing = db.query(QuestionRule).filter(QuestionRule.question_type == question_type).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="A Question Rule already exists for this Question Type. Use Edit to update it.")
+    row = db.query(QuestionRule).filter(QuestionRule.question_type == question_type).first()
     data = body.dict()
     data["question_type"] = question_type
-    row = QuestionRule(question_type=question_type, rule_json=json.dumps(data, ensure_ascii=False))
-    db.add(row)
+    if row is None:
+        row = QuestionRule(question_type=question_type, rule_json=json.dumps(data, ensure_ascii=False))
+        db.add(row)
+    else:
+        row.rule_json = json.dumps(data, ensure_ascii=False)
+        row.updated_at = utcnow()
     db.commit()
     db.refresh(row)
     return {"ok": True, "rule": _question_rule_dict(row)}
 
 
 @app.put("/admin/question-rules/{rule_id}")
-def admin_update_question_rule(rule_id: int, body: QuestionRuleBody, admin=Depends(current_admin), db: Session=Depends(get_db)):
+def admin_update_question_rule(
+    rule_id: int,
+    body: QuestionRuleBody,
+    admin=Depends(current_admin),
+    db: Session=Depends(get_db)
+):
     row = db.query(QuestionRule).filter(QuestionRule.id == rule_id).first()
     if not row:
-        raise HTTPException(status_code=404, detail="Question Rule not found. Refresh the list and try again.")
+        raise HTTPException(status_code=404, detail="Question Rule not found.")
     question_type = body.question_type.strip()
     if not question_type:
         raise HTTPException(status_code=400, detail="Select a Question Type.")
